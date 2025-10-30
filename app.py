@@ -14,13 +14,13 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 import streamlit as st
 from openai import OpenAI
 
-APP_VERSION = "press2ppt v1.4 - URL 取得 + コピペ&画像アップ対応"
+APP_VERSION = "press2ppt v1.8 "
 
 # ========= 設定 =========
 TEMPLATE_PATH = "templates/cuprum_template.pptx"
 DEFAULT_FONTS = ["Meiryo", "Yu Gothic UI", "MS UI Gothic", "Calibri"]
 
-# スタイル設定（要望通り）
+# スタイル設定（要望どおり）
 TITLE_COLOR = RGBColor(255, 255, 255)   # 白
 TITLE_SIZE_PT = 28
 TITLE_BOLD = True
@@ -154,16 +154,20 @@ def _parse_common(html: str, base_url: str = "") -> dict:
 
     return {"title": title, "text": text, "images": uniq}
 
-# ========= 要約 =========
+# ========= 要約（プロンプト更新・仕上げ関数含む） =========
 SYS_TITLER = (
     "あなたは日本語のPRアシスタントです。25文字を超える場合のみ自然な見出しに短縮。"
     "句読点含め25文字以内、固有名詞は優先して保持。"
 )
 SYS_SUMMARY = (
-    "あなたは日本語のPRアシスタントです。企業プレスリリースの要旨を指定の上限文字数以内で簡潔に要約。"
-    "目的はプレスリリースの内容を社内発信することです。"
-    "体言止めや重言を避け、固有名詞は維持。ですます調。"
-    "JX金属株式会社が主語の場合は省略、同様に当社なども省略、それでも意味が通る内容に要約すること。"
+    "あなたは日本語のPRアシスタントです。企業プレスリリースの要旨を、"
+    "指定の上限文字数以内で簡潔に要約してください。"
+    "上限文字数の90%~95%の文字数に必ずして"
+    "文を途中で切らず、句点「。」で完結させること。"
+    "必要に応じて短文に分けても構いません。"
+    "体言止めや重言は避け、固有名詞は保持。ですます調。"
+    "JX金属株式会社やJX金属、JX等の主語は必ず省略し、それでも意味が通るように。"
+    "冗長表現や重複を削り、意味を保ったまま上限以内に収めてください。"
 )
 
 def gpt_shorten_title(client: Optional[OpenAI], title: str) -> str:
@@ -190,24 +194,59 @@ def offline_summary(text: str) -> str:
     chunk = re.sub(r"\s+", " ", chunk)
     return chunk
 
+def _tidy_clamp_to_limit(s: str, limit: int) -> str:
+    """limitを超える場合、句点などの区切りで自然に短縮する。"""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    candidates = ["。", "！", "？", "!", "?", "…"]
+    cut_pos = -1
+    for ch in candidates:
+        p = s.rfind(ch, 0, limit)
+        if p > cut_pos:
+            cut_pos = p
+    if cut_pos >= 0 and cut_pos >= int(limit * 0.5):
+        return s[:cut_pos + 1].strip()
+    return s[:limit].rstrip("・、，,（(").rstrip()
+
 def gpt_summarize_body(client: Optional[OpenAI], text: str, max_len: int = 120) -> str:
-    head = text[:4000]
+    head = (text or "")[:4000]
     base = offline_summary(head)
     if not client:
-        return base[:max_len]
+        return _tidy_clamp_to_limit(base, max_len)
     try:
+        prompt_user = (
+            f"{head}\n\n"
+            f"上限{max_len}文字で、重要点を落とさず簡潔に要約してください。"
+            f"文は途中で切らず、句点で完結させてください。"
+        )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": SYS_SUMMARY},
-                {"role": "user", "content": f"{head}\n\n上限{max_len}文字で、重要点を落とさず簡潔に要約してください。"},
+                {"role": "user", "content": prompt_user},
             ],
             temperature=0.2,
         )
         s = (resp.choices[0].message.content or "").strip()
-        return s[:max_len]
+        return _tidy_clamp_to_limit(s, max_len)
     except Exception:
-        return base[:max_len]
+        return _tidy_clamp_to_limit(base, max_len)
+
+# 両モード共通：どのエンジンで要約したかも返す
+def do_summary(text: str, max_len: int, api_key: Optional[str]) -> tuple[str, str]:
+    """
+    返り値: (要約文, エンジン種別 "GPT" or "OFFLINE")
+    """
+    client = get_client(api_key or None)
+    if client:
+        try:
+            s = gpt_summarize_body(client, text, max_len)
+            return s, "GPT"
+        except Exception:
+            pass
+    s = gpt_summarize_body(None, text, max_len)
+    return s, "OFFLINE"
 
 # ========= 画像DL（URLモード用） =========
 def download_images(urls: List[str], limit: int = 4) -> List[Image.Image]:
@@ -322,27 +361,29 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
     return out.read()
 
 # ========= UI =========
-st.set_page_config(page_title="プレス/コピペ → Cuprum PPT", page_icon="🧩", layout="wide")
+st.set_page_config(page_title="プレスURL / コピペ → Cuprum PPT", page_icon="🧩", layout="wide")
 st.title(f"プレスURL or コピペ＋画像 → Cuprumテンプレ自動作成｜{APP_VERSION}")
 
 with st.sidebar:
     st.header("設定")
     template_file = st.file_uploader("テンプレ（.pptx）を差し替え可", type=["pptx"])
-    api_key = st.text_input("OpenAI API Key（未入力/失敗時はローカル要約）", type="password")
+    api_key = st.text_input("OpenAI API Key（未入力/失敗時はオフライン要約）", type="password")
     max_images = st.slider("最大画像数（先頭から使用、上限3枚）", 0, 6, 3)
-    summary_length = st.slider("要約文字数上限（目安）", 120, 400, 120, 20)
+    summary_length = st.slider("要約文字数上限（目安）", 120, 400, 160, 20)
+    show_debug = st.checkbox("🧩 デバッグ出力を表示", value=True)
     st.caption("タイトル>25文字は短縮。本文は上限文字数で要約（コピペ版は要約オプション）。")
 
-mode = st.radio("入力モード", ["URLモード", "コピペ＋画像アップロード"], horizontal=True)
+mode = st.radio("入力モード", ["プレスリリースモード", "Sharepointコピペモード"], horizontal=True)
 
 # 共有の作業用変数
 title_final = ""
 summary_final = ""
+engine_used = "NO_SUMMARY"
 images: List[Image.Image] = []
 parsed_preview = None  # プレビュー用
 
 # ============== モード1：URLモード ==============
-if mode == "URLモード":
+if mode == "プレスリリースモード":
     url = st.text_input("プレスリリースのURL（社外サイト推奨）")
     if st.button("① 内容を抽出（URLから）"):
         try:
@@ -369,10 +410,13 @@ if mode == "URLモード":
             else:
                 st.write("（画像候補なし）")
 
-        # 要約 & タイトル調整
+        # タイトル短縮
         client = get_client(api_key or None)
         title_final = gpt_shorten_title(client, parsed.get("title") or "（無題）")
-        summary_final = gpt_summarize_body(client, parsed.get("text") or "", summary_length)
+
+        # 要約（統一ルート）
+        summary_final, engine_used = do_summary(parsed.get("text") or "", summary_length, api_key)
+        st.info(f"要約エンジン: {engine_used} / 原文: {len(parsed.get('text') or '')}文字 → 出力: {len(summary_final)}文字")
 
         # 画像DL
         sel_urls = parsed.get("images", [])[:max_images]
@@ -393,7 +437,7 @@ else:
     manual_body = st.text_area("記事本文（コピペ）", height=220)
     colA, colB = st.columns(2)
     with colA:
-        do_summarize = st.checkbox("本文を要約する（上限はサイドバーの文字数）", value=True)
+        do_summarize = st.checkbox("本文を要約する（サイドバーの上限文字数を使用）", value=True)
     with colB:
         do_shorten_title = st.checkbox("タイトルが25文字超なら短縮する", value=True)
 
@@ -410,14 +454,14 @@ else:
             if do_shorten_title:
                 title_final = gpt_shorten_title(client, manual_title or "（無題）")
             else:
-                title_final = (manual_title or "（無題）")[:100]  # 暫定で100文字制限
+                title_final = (manual_title or "（無題）")[:100]
 
-            # 本文整形
+            # 本文整形（統一ルート or 切り詰め）
             if do_summarize:
-                summary_final = gpt_summarize_body(client, manual_body or "", summary_length)
+                summary_final, engine_used = do_summary(manual_body or "", summary_length, api_key)
             else:
-                txt = manual_body or ""
-                summary_final = txt[:summary_length]
+                summary_final = (manual_body or "")[:summary_length]
+                engine_used = "NO_SUMMARY"
 
             # 画像（アップロード → PIL）
             images = []
@@ -433,6 +477,9 @@ else:
                 "title": title_final,
                 "summary": summary_final,
                 "images_len": len(images),
+                "engine": engine_used,
+                "raw_len": len(manual_body or ""),
+                "out_len": len(summary_final or ""),
             }
             st.session_state["manual_images"] = images
             st.success("プレビューを作成しました。下で確認してください。")
@@ -442,7 +489,8 @@ else:
     if manual_prev:
         st.subheader("抽出結果プレビュー（コピペ版）")
         st.write("**タイトル（最終）**:", manual_prev["title"])
-        st.write(f"**本文（{len(manual_prev['summary'])}文字）**:", manual_prev["summary"])
+        st.write(f"**本文（{manual_prev['out_len']}文字 / エンジン: {manual_prev['engine']} / 原文{manual_prev['raw_len']}文字）**:")
+        st.write(manual_prev["summary"])
         if images:
             cols = st.columns(min(len(images), 3))
             for i, img in enumerate(images):
@@ -453,9 +501,10 @@ else:
 
         title_final = manual_prev["title"]
         summary_final = manual_prev["summary"]
+        engine_used = manual_prev["engine"]
         parsed_preview = manual_prev
 
-# ============== 共通：PPT生成 ==============
+# ============== 共通：PPT生成（デバッグ出力あり） ==============
 st.markdown("---")
 if st.button("② PPTを作成してダウンロード"):
     try:
@@ -471,6 +520,20 @@ if st.button("② PPTを作成してダウンロード"):
         elif not parsed_preview:
             st.error("先に①でプレビューを作成してください。")
         else:
+            if show_debug:
+                st.write({
+                    "layout_candidates": [
+                        "Cuprum Title+Body",
+                        "Cuprum Title+Body+1Pic",
+                        "Cuprum Title+Body+2Pic",
+                        "Cuprum Title+Body+3Pic",
+                    ],
+                    "images_count": len(images or []),
+                    "title_preview": (title_final[:40] + ("…" if len(title_final) > 40 else "")),
+                    "summary_preview": (summary_final[:60] + ("…" if len(summary_final) > 60 else "")),
+                    "engine_used": engine_used,
+                })
+
             ppt_bytes = build_pptx(tpl_path, title_final or "（無題）", summary_final or "", images or [])
             if not isinstance(ppt_bytes, (bytes, bytearray)) or len(ppt_bytes) == 0:
                 st.error("PPT生成に失敗しました（データ不正または空ファイル）。")
