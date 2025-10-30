@@ -13,7 +13,7 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 import streamlit as st
 from openai import OpenAI
 
-APP_VERSION = "press2ppt v1.1 - insert_picture & summary slider"
+APP_VERSION = "press2ppt v1.1"
 
 # ========= 設定 =========
 TEMPLATE_PATH = "templates/cuprum_template.pptx"
@@ -432,3 +432,4 @@ if gen:
         st.code("".join(traceback.format_exc()))
 else:
     st.caption("URLを入力して『① 内容を抽出（要約プレビュー）』を押してください。")
+
