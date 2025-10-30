@@ -1,0 +1,8 @@
+streamlit
+requests
+beautifulsoup4
+lxml
+python-pptx
+Pillow
+readability-lxml
+openai>=1.35.0
