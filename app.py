@@ -14,22 +14,22 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 import streamlit as st
 from openai import OpenAI
 
-APP_VERSION = "press2ppt v1.8 "
+APP_VERSION = "press2ppt v1.8 (image fix)"
 
 # ========= 設定 =========
 TEMPLATE_PATH = "templates/cuprum_template.pptx"
 DEFAULT_FONTS = ["Meiryo", "Yu Gothic UI", "MS UI Gothic", "Calibri"]
 
-# スタイル設定（要望どおり）
-TITLE_COLOR = RGBColor(255, 255, 255)   # 白
+# スタイル設定
+TITLE_COLOR = RGBColor(255, 255, 255)
 TITLE_SIZE_PT = 28
 TITLE_BOLD = True
 
-BODY_COLOR = RGBColor(0, 153, 153)      # #009999
+BODY_COLOR = RGBColor(0, 153, 153)
 BODY_SIZE_PT = 24
 BODY_BOLD = True
 
-# ロゴ等の除外（URLモードで使用）
+# ロゴ等の除外設定
 IMG_EXCLUDE_RE = re.compile(
     r"(?:^|[-_/])(logo|favicon|sprite|badge|mark|header|footer|og_image|common/images/og_image\.png)\b",
     re.IGNORECASE,
@@ -39,6 +39,44 @@ EXACT_IMG_BLACKLIST = {
     "http://www.jx-nmm.com/common/images/og_image.png",
 }
 
+# ========= 追加: HEIC/AVIF対応 =========
+HEIF_OK = False
+AVIF_OK = False
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_OK = True
+except Exception:
+    pass
+
+try:
+    import pillow_avif
+    AVIF_OK = True
+except Exception:
+    pass
+
+
+def _open_image_any(file_obj) -> Optional[Image.Image]:
+    try:
+        if hasattr(file_obj, "read"):
+            data = file_obj.read()
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+        elif isinstance(file_obj, (bytes, bytearray)):
+            data = file_obj
+        else:
+            data = file_obj.getvalue()
+        buf = io.BytesIO(data)
+        img = Image.open(buf)
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        return img.convert("RGB")
+    except Exception:
+        return None
+
+
 # ========= OpenAI =========
 def get_client(api_key: Optional[str]):
     try:
@@ -46,11 +84,13 @@ def get_client(api_key: Optional[str]):
     except Exception:
         return None
 
-# ========= HTML取得（公開サイト用 / URLモード） =========
+
+# ========= HTML取得 =========
 def fetch_html_public(url: str) -> str:
     r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
+
 
 def _best_from_srcset(srcset: str) -> Optional[str]:
     try:
@@ -73,9 +113,11 @@ def _best_from_srcset(srcset: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def parse_page(url: str) -> dict:
     html = fetch_html_public(url)
     return _parse_common(html, base_url=url)
+
 
 def _parse_common(html: str, base_url: str = "") -> dict:
     doc = Document(html)
@@ -93,11 +135,9 @@ def _parse_common(html: str, base_url: str = "") -> dict:
     main_html = doc.summary(html_partial=True)
     soup = BeautifulSoup(main_html, "lxml")
 
-    # 本文テキスト
     ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
     text = " ".join(ps)
 
-    # 画像候補（相対→絶対）
     def abs_url(u: str) -> str:
         if not base_url:
             return u
@@ -121,7 +161,6 @@ def _parse_common(html: str, base_url: str = "") -> dict:
                 if cand:
                     urls.append(abs_url(cand))
 
-    # フォールバック: head の og/twitter image
     try:
         head = BeautifulSoup(html, "lxml").find("head")
         if head:
@@ -132,7 +171,6 @@ def _parse_common(html: str, base_url: str = "") -> dict:
     except Exception:
         pass
 
-    # 除外 & 重複排除
     cleaned = []
     for u in urls:
         if not u or u.startswith("data:"):
@@ -154,7 +192,8 @@ def _parse_common(html: str, base_url: str = "") -> dict:
 
     return {"title": title, "text": text, "images": uniq}
 
-# ========= 要約（プロンプト更新・仕上げ関数含む） =========
+
+# ========= 要約処理 =========
 SYS_TITLER = (
     "あなたは日本語のPRアシスタントです。25文字を超える場合のみ自然な見出しに短縮。"
     "句読点含め25文字以内、固有名詞は優先して保持。"
@@ -169,6 +208,7 @@ SYS_SUMMARY = (
     "JX金属株式会社やJX金属、JX等の主語は必ず省略し、それでも意味が通るように。"
     "冗長表現や重複を削り、意味を保ったまま上限以内に収めてください。"
 )
+
 
 def gpt_shorten_title(client: Optional[OpenAI], title: str) -> str:
     if len(title) <= 25 or not client:
@@ -186,6 +226,7 @@ def gpt_shorten_title(client: Optional[OpenAI], title: str) -> str:
     except Exception:
         return title[:25]
 
+
 def offline_summary(text: str) -> str:
     if not text:
         return ""
@@ -194,8 +235,8 @@ def offline_summary(text: str) -> str:
     chunk = re.sub(r"\s+", " ", chunk)
     return chunk
 
+
 def _tidy_clamp_to_limit(s: str, limit: int) -> str:
-    """limitを超える場合、句点などの区切りで自然に短縮する。"""
     s = s.strip()
     if len(s) <= limit:
         return s
@@ -208,6 +249,7 @@ def _tidy_clamp_to_limit(s: str, limit: int) -> str:
     if cut_pos >= 0 and cut_pos >= int(limit * 0.5):
         return s[:cut_pos + 1].strip()
     return s[:limit].rstrip("・、，,（(").rstrip()
+
 
 def gpt_summarize_body(client: Optional[OpenAI], text: str, max_len: int = 120) -> str:
     head = (text or "")[:4000]
@@ -233,11 +275,8 @@ def gpt_summarize_body(client: Optional[OpenAI], text: str, max_len: int = 120) 
     except Exception:
         return _tidy_clamp_to_limit(base, max_len)
 
-# 両モード共通：どのエンジンで要約したかも返す
+
 def do_summary(text: str, max_len: int, api_key: Optional[str]) -> tuple[str, str]:
-    """
-    返り値: (要約文, エンジン種別 "GPT" or "OFFLINE")
-    """
     client = get_client(api_key or None)
     if client:
         try:
@@ -248,7 +287,8 @@ def do_summary(text: str, max_len: int, api_key: Optional[str]) -> tuple[str, st
     s = gpt_summarize_body(None, text, max_len)
     return s, "OFFLINE"
 
-# ========= 画像DL（URLモード用） =========
+
+# ========= 画像DL =========
 def download_images(urls: List[str], limit: int = 4) -> List[Image.Image]:
     imgs: List[Image.Image] = []
     for u in urls[:limit]:
@@ -263,6 +303,7 @@ def download_images(urls: List[str], limit: int = 4) -> List[Image.Image]:
             continue
     return imgs
 
+
 # ========= PowerPoint生成 =========
 def _first_placeholder(slide, types: tuple[int, ...]) -> Optional[object]:
     for ph in slide.placeholders:
@@ -272,6 +313,7 @@ def _first_placeholder(slide, types: tuple[int, ...]) -> Optional[object]:
         except Exception:
             continue
     return None
+
 
 def _set_text(shape, text: str, size_pt: int, color: RGBColor, bold: bool):
     try:
@@ -294,13 +336,47 @@ def _set_text(shape, text: str, size_pt: int, color: RGBColor, bold: bool):
     except Exception:
         pass
 
+
 def get_layout_by_name(prs, name: str):
     for layout in prs.slide_layouts:
         if layout.name == name:
             return layout
     return None
 
-def build_pptx(template_path: str, title: str, summary: str, images: List[Image.Image]) -> bytes:
+
+def _place_image_contain(slide, ph, img: Image.Image):
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+
+    frame_w = ph.width
+    frame_h = ph.height
+    frame_left = ph.left
+    frame_top = ph.top
+
+    iw, ih = img.size
+    a_img = iw / ih
+    a_frame = frame_w / frame_h
+
+    if a_img >= a_frame:
+        w = frame_w
+        h = int(frame_w / a_img)
+    else:
+        h = frame_h
+        w = int(frame_h * a_img)
+
+    left = frame_left + int((frame_w - w) / 2)
+    top = frame_top + int((frame_h - h) / 2)
+
+    pic = slide.shapes.add_picture(buf, left, top, width=w, height=h)
+    try:
+        ph.element.getparent().remove(ph.element)
+    except Exception:
+        pass
+    return pic
+
+
+def build_pptx(template_path: str, title: str, summary: str, images: List[Image.Image], fit_mode: str) -> bytes:
     prs = Presentation(template_path)
 
     n = min(len(images), 3)
@@ -313,7 +389,6 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
     layout = get_layout_by_name(prs, layout_name) or prs.slide_layouts[0]
     slide = prs.slides.add_slide(layout)
 
-    # タイトル
     title_ph = _first_placeholder(slide, (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE))
     if title_ph is None:
         for ph in slide.placeholders:
@@ -323,7 +398,6 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
     if title_ph is not None:
         _set_text(title_ph, title, TITLE_SIZE_PT, TITLE_COLOR, TITLE_BOLD)
 
-    # 本文
     body_ph = _first_placeholder(slide, (PP_PLACEHOLDER.BODY,))
     if body_ph is None:
         body_ph = _first_placeholder(slide, (PP_PLACEHOLDER.CONTENT,))
@@ -335,7 +409,6 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
     if body_ph is not None:
         _set_text(body_ph, summary, BODY_SIZE_PT, BODY_COLOR, BODY_BOLD)
 
-    # 画像（プレースホルダー優先）
     pic_placeholders = []
     for ph in slide.placeholders:
         try:
@@ -345,20 +418,26 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
             continue
     pic_placeholders.sort(key=lambda sh: (sh.left, sh.top))
 
-    for i, img in enumerate(images[:len(pic_placeholders)]):
+    use_n = min(len(images), len(pic_placeholders))
+    for i in range(use_n):
         ph = pic_placeholders[i]
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        buf.seek(0)
-        try:
-            ph.insert_picture(buf)
-        except Exception:
-            slide.shapes.add_picture(buf, ph.left, ph.top, width=ph.width)
+        img = images[i]
+        if fit_mode.startswith("収める"):
+            _place_image_contain(slide, ph, img)
+        else:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG")
+            buf.seek(0)
+            try:
+                ph.insert_picture(buf)
+            except Exception:
+                slide.shapes.add_picture(buf, ph.left, ph.top, width=ph.width)
 
     out = io.BytesIO()
     prs.save(out)
     out.seek(0)
     return out.read()
+
 
 # ========= UI =========
 st.set_page_config(page_title="プレスURL / コピペ → Cuprum PPT", page_icon="🧩", layout="wide")
@@ -370,6 +449,7 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API Key（未入力/失敗時はオフライン要約）", type="password")
     max_images = st.slider("最大画像数（先頭から使用、上限3枚）", 0, 6, 3)
     summary_length = st.slider("要約文字数上限（目安）", 120, 400, 160, 20)
+    fit_mode = st.selectbox("画像のはめ込み方法", ["収める（余白あり・全体表示）", "埋める（トリミングあり）"], index=0)
     show_debug = st.checkbox("🧩 デバッグ出力を表示", value=True)
     st.caption("タイトル>25文字は短縮。本文は上限文字数で要約（コピペ版は要約オプション）。")
 
@@ -380,7 +460,7 @@ title_final = ""
 summary_final = ""
 engine_used = "NO_SUMMARY"
 images: List[Image.Image] = []
-parsed_preview = None  # プレビュー用
+parsed_preview = None
 
 # ============== モード1：URLモード ==============
 if mode == "プレスリリースモード":
@@ -410,15 +490,12 @@ if mode == "プレスリリースモード":
             else:
                 st.write("（画像候補なし）")
 
-        # タイトル短縮
         client = get_client(api_key or None)
         title_final = gpt_shorten_title(client, parsed.get("title") or "（無題）")
 
-        # 要約（統一ルート）
         summary_final, engine_used = do_summary(parsed.get("text") or "", summary_length, api_key)
         st.info(f"要約エンジン: {engine_used} / 原文: {len(parsed.get('text') or '')}文字 → 出力: {len(summary_final)}文字")
 
-        # 画像DL
         sel_urls = parsed.get("images", [])[:max_images]
         images = download_images(sel_urls, limit=max_images)
         if images:
@@ -442,36 +519,44 @@ else:
         do_shorten_title = st.checkbox("タイトルが25文字超なら短縮する", value=True)
 
     uploaded_files = st.file_uploader(
-        "画像をアップロード（最大3枚まで）", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
+        "画像をアップロード（最大3枚まで）",
+        type=[
+            "jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif", "gif",
+            "heic", "heif",
+            "avif"
+        ],
+        accept_multiple_files=True
     )
+
+    with st.expander("対応フォーマット情報", expanded=False):
+        st.write(f"HEIC/HEIF対応: {'✅' if HEIF_OK else '⚠️ pillow-heif未導入'}")
+        st.write(f"AVIF対応: {'✅' if AVIF_OK else '⚠️ pillow-avif-plugin未導入'}")
 
     if st.button("① プレビュー生成（コピペ版）"):
         if not manual_title and not manual_body:
             st.warning("タイトルまたは本文のどちらかは入力してください。")
         else:
-            # タイトル整形
             client = get_client(api_key or None)
             if do_shorten_title:
                 title_final = gpt_shorten_title(client, manual_title or "（無題）")
             else:
                 title_final = (manual_title or "（無題）")[:100]
 
-            # 本文整形（統一ルート or 切り詰め）
             if do_summarize:
                 summary_final, engine_used = do_summary(manual_body or "", summary_length, api_key)
             else:
                 summary_final = (manual_body or "")[:summary_length]
                 engine_used = "NO_SUMMARY"
 
-            # 画像（アップロード → PIL）
             images = []
             if uploaded_files:
                 for f in uploaded_files[:3]:
-                    try:
-                        img = Image.open(f).convert("RGB")
-                        images.append(img)
-                    except Exception:
+                    img = _open_image_any(f)
+                    if img is None:
                         continue
+                    if img.width < 300 or img.height < 180:
+                        continue
+                    images.append(img)
 
             st.session_state["manual_preview"] = {
                 "title": title_final,
@@ -521,6 +606,7 @@ if st.button("② PPTを作成してダウンロード"):
             st.error("先に①でプレビューを作成してください。")
         else:
             if show_debug:
+                # slide は build 内なのでここでは概況だけ
                 st.write({
                     "layout_candidates": [
                         "Cuprum Title+Body",
@@ -529,12 +615,19 @@ if st.button("② PPTを作成してダウンロード"):
                         "Cuprum Title+Body+3Pic",
                     ],
                     "images_count": len(images or []),
+                    "fit_mode": fit_mode,
                     "title_preview": (title_final[:40] + ("…" if len(title_final) > 40 else "")),
                     "summary_preview": (summary_final[:60] + ("…" if len(summary_final) > 60 else "")),
                     "engine_used": engine_used,
                 })
 
-            ppt_bytes = build_pptx(tpl_path, title_final or "（無題）", summary_final or "", images or [])
+            ppt_bytes = build_pptx(
+                tpl_path,
+                title_final or "（無題）",
+                summary_final or "",
+                images or [],
+                fit_mode=fit_mode
+            )
             if not isinstance(ppt_bytes, (bytes, bytearray)) or len(ppt_bytes) == 0:
                 st.error("PPT生成に失敗しました（データ不正または空ファイル）。")
             else:
