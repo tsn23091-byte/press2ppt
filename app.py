@@ -456,10 +456,10 @@ def build_pptx(
 
 
 # ========= 画像リサイズ用ヘルパー =========
-def crop_to_4_3_center(img: Image.Image) -> Image.Image:
-    """中央を4:3にトリミング（縦横どちらでもOK）"""
+def crop_to_16_9_center(img: Image.Image) -> Image.Image:
+    """中央を16:9にトリミング（縦横どちらでもOK）"""
     w, h = img.size
-    target_ratio = 4 / 3
+    target_ratio = 16 / 9
     current_ratio = w / h
 
     if current_ratio > target_ratio:
@@ -472,6 +472,7 @@ def crop_to_4_3_center(img: Image.Image) -> Image.Image:
         new_h = int(w / target_ratio)
         top = (h - new_h) // 2
         box = (0, top, w, top + new_h)
+
     return img.crop(box)
 
 
@@ -677,7 +678,7 @@ elif mode == "Sharepointコピペモード":
 
 # ============== モード3：画像リサイズモード ==============
 else:
-    st.subheader("画像リサイズモード（4:3トリミング＋PNG変換）")
+    st.subheader("画像リサイズモード（16:9トリミング＋JPEG変換）")
 
     resize_px = st.radio(
         "長辺ピクセル数を選択",
@@ -695,11 +696,9 @@ else:
         accept_multiple_files=True,
     )
 
-    # ここで処理した画像をためておく
     processed_images: List[tuple[str, Image.Image]] = []
 
     if uploaded_photos:
-        # セッションに「確定済みトリミング」を保持する辞書を用意
         if "crop_results" not in st.session_state:
             st.session_state["crop_results"] = {}
         crop_results = st.session_state["crop_results"]
@@ -711,59 +710,59 @@ else:
 
             w, h = img.size
             ratio = w / h if h != 0 else 0
-            target_ratio = 4 / 3
+            target_ratio = 16 / 9
             is_landscape = w >= h
-            is_almost_4_3 = is_landscape and abs(ratio - target_ratio) < 0.02
+            is_almost_16_9 = is_landscape and abs(ratio - target_ratio) < 0.02
 
             st.write(f"### 画像 {idx+1}: {getattr(f, 'name', f'image_{idx+1}')}")
             st.image(img, caption="元画像プレビュー", use_container_width=True)
 
-            # まず「候補のクロップ画像」を作る（UIで調整用）
-            if is_almost_4_3:
-                st.info("ほぼ4:3の横画像のため、そのままリサイズ対象にします。")
+            # ▼ プレビュー用クロップ画像
+            if is_almost_16_9:
+                st.info("ほぼ16:9の横画像のため、そのままリサイズ対象にします。")
                 preview_crop = img
             else:
                 if CROPPER_OK:
                     st.info(
-                        "4:3以外または縦画像のため、4:3でトリミングしてください。"
-                        "枠を調整してから、下の『このトリミングを確定』を押すと固定されます。"
+                        "16:9以外または縦画像のため、16:9でトリミングしてください。"
+                        "枠を調整し、『このトリミングを確定』を押してください。"
                     )
                     preview_crop = st_cropper(
                         img,
-                        aspect_ratio=(4, 3),
+                        aspect_ratio=(16, 9),
                         box_color="#00FF00",
                         key=f"cropper_{idx}",
-                        realtime_update=True,   # プレビューは動かすたびに更新
+                        realtime_update=True,
                         return_type="image",
                     )
                 else:
                     st.warning(
-                        "streamlit-cropper未導入のため、自動で中央4:3にトリミングします。"
+                        "streamlit-cropper未導入のため、自動で中央16:9にトリミングします。"
                     )
-                    preview_crop = crop_to_4_3_center(img)
+                    preview_crop = crop_to_16_9_center(img)
 
-            # 「このトリミングで固定」ボタン
+            # ▼ トリミング確定
             confirm_key = f"confirm_crop_{idx}"
             if st.button("このトリミングを確定", key=confirm_key):
                 crop_results[idx] = preview_crop
                 st.success("この画像のトリミングを確定しました。")
 
-            # 実際にリサイズに使う画像：確定済みがあればそれを使う
             used_crop = crop_results.get(idx, preview_crop)
 
+            # ▼ リサイズ処理
             resized = resize_long_side(used_crop, resize_px)
             st.image(
                 resized,
-                caption=f"リサイズ後プレビュー（長辺 {resize_px}px / PNG出力）",
+                caption=f"リサイズ後プレビュー（長辺 {resize_px}px / JPEG出力）",
                 use_container_width=True,
             )
 
             base_name = getattr(f, "name", f"image_{idx+1}")
             base_name = re.sub(r"\.[^.]+$", "", base_name)
-            out_name = f"{base_name}_{resize_px}px.png"
+            out_name = f"{base_name}_{resize_px}px.jpg"
             processed_images.append((out_name, resized))
 
-    # ZIPダウンロードは「今のプレビューたち」をまとめるだけ
+    # ▼ ZIPダウンロード
     if processed_images:
         import zipfile
 
@@ -771,12 +770,12 @@ else:
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for fname, im in processed_images:
                 img_bytes = io.BytesIO()
-                im.save(img_bytes, format="PNG")
+                im.save(img_bytes, format="JPEG", quality=92)
                 img_bytes.seek(0)
                 zf.writestr(fname, img_bytes.read())
         zip_buf.seek(0)
 
-        st.success(f"{len(processed_images)} ファイルをリサイズし、ZIPにまとめました。")
+        st.success(f"{len(processed_images)} ファイルを処理し、ZIPにまとめました。")
         st.download_button(
             "リサイズ画像ZIPをダウンロード",
             data=zip_buf,
