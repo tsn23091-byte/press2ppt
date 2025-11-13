@@ -14,7 +14,7 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 import streamlit as st
 from openai import OpenAI
 
-APP_VERSION = "press2ppt v1.9 (image resize mode)"
+APP_VERSION = "v2.0"
 
 # ========= 設定 =========
 TEMPLATE_PATH = "templates/cuprum_template.pptx"
@@ -490,11 +490,11 @@ def resize_long_side(img: Image.Image, long_side_px: int) -> Image.Image:
 
 # ========= UI =========
 st.set_page_config(
-    page_title="プレスURL / コピペ / 画像リサイズ → Cuprum PPT",
+    page_title="CC便利くん",
     page_icon="🧩",
     layout="wide",
 )
-st.title(f"プレスURL / コピペ＋画像 / リサイズ → Cuprumテンプレ自動作成｜{APP_VERSION}")
+st.title(f"CC便利くん｜{APP_VERSION}")
 
 with st.sidebar:
     st.header("設定")
@@ -853,3 +853,4 @@ if mode in ["プレスリリースモード", "Sharepointコピペモード"]:
             st.code("".join(traceback.format_exc()))
     else:
         st.caption("① 抽出/プレビュー → ② PPT作成 の順で操作してください。")
+
