@@ -14,7 +14,7 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 import streamlit as st
 from openai import OpenAI
 
-APP_VERSION = "press2ppt v1.8 (image fix)"
+APP_VERSION = "press2ppt v1.9 (image resize mode)"
 
 # ========= 設定 =========
 TEMPLATE_PATH = "templates/cuprum_template.pptx"
@@ -54,6 +54,14 @@ try:
     AVIF_OK = True
 except Exception:
     pass
+
+# ========= 追加: 画像トリミングUI（streamlit-cropper） =========
+CROPPER_OK = False
+try:
+    from streamlit_cropper import st_cropper
+    CROPPER_OK = True
+except Exception:
+    CROPPER_OK = False
 
 
 def _open_image_any(file_obj) -> Optional[Image.Image]:
@@ -165,7 +173,9 @@ def _parse_common(html: str, base_url: str = "") -> dict:
         head = BeautifulSoup(html, "lxml").find("head")
         if head:
             for prop in ["og:image", "twitter:image"]:
-                tag = head.find("meta", property=prop) or head.find("meta", attrs={"name": prop})
+                tag = head.find("meta", property=prop) or head.find(
+                    "meta", attrs={"name": prop}
+                )
                 if tag and tag.get("content"):
                     urls.append(abs_url(tag["content"]))
     except Exception:
@@ -376,7 +386,13 @@ def _place_image_contain(slide, ph, img: Image.Image):
     return pic
 
 
-def build_pptx(template_path: str, title: str, summary: str, images: List[Image.Image], fit_mode: str) -> bytes:
+def build_pptx(
+    template_path: str,
+    title: str,
+    summary: str,
+    images: List[Image.Image],
+    fit_mode: str,
+) -> bytes:
     prs = Presentation(template_path)
 
     n = min(len(images), 3)
@@ -439,9 +455,45 @@ def build_pptx(template_path: str, title: str, summary: str, images: List[Image.
     return out.read()
 
 
+# ========= 画像リサイズ用ヘルパー =========
+def crop_to_4_3_center(img: Image.Image) -> Image.Image:
+    """中央を4:3にトリミング（縦横どちらでもOK）"""
+    w, h = img.size
+    target_ratio = 4 / 3
+    current_ratio = w / h
+
+    if current_ratio > target_ratio:
+        # 横に長い → 幅を削る
+        new_w = int(h * target_ratio)
+        left = (w - new_w) // 2
+        box = (left, 0, left + new_w, h)
+    else:
+        # 縦に長い → 高さを削る
+        new_h = int(w / target_ratio)
+        top = (h - new_h) // 2
+        box = (0, top, w, top + new_h)
+    return img.crop(box)
+
+
+def resize_long_side(img: Image.Image, long_side_px: int) -> Image.Image:
+    """長辺を指定pxに合わせてリサイズ（アスペクト比維持）"""
+    w, h = img.size
+    long_side = max(w, h)
+    if long_side <= 0:
+        return img
+    scale = long_side_px / long_side
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
 # ========= UI =========
-st.set_page_config(page_title="プレスURL / コピペ → Cuprum PPT", page_icon="🧩", layout="wide")
-st.title(f"プレスURL or コピペ＋画像 → Cuprumテンプレ自動作成｜{APP_VERSION}")
+st.set_page_config(
+    page_title="プレスURL / コピペ / 画像リサイズ → Cuprum PPT",
+    page_icon="🧩",
+    layout="wide",
+)
+st.title(f"プレスURL / コピペ＋画像 / リサイズ → Cuprumテンプレ自動作成｜{APP_VERSION}")
 
 with st.sidebar:
     st.header("設定")
@@ -449,13 +501,26 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API Key（未入力/失敗時はオフライン要約）", type="password")
     max_images = st.slider("最大画像数（先頭から使用、上限3枚）", 0, 6, 3)
     summary_length = st.slider("要約文字数上限（目安）", 120, 400, 160, 20)
-    fit_mode = st.selectbox("画像のはめ込み方法", ["収める（余白あり・全体表示）", "埋める（トリミングあり）"], index=0)
+    fit_mode = st.selectbox(
+        "画像のはめ込み方法",
+        ["収める（余白あり・全体表示）", "埋める（トリミングあり）"],
+        index=0,
+    )
     show_debug = st.checkbox("🧩 デバッグ出力を表示", value=True)
     st.caption("タイトル>25文字は短縮。本文は上限文字数で要約（コピペ版は要約オプション）。")
+    st.markdown("---")
+    st.subheader("画像リサイズモード用情報")
+    st.write(f"HEIC/HEIF対応: {'✅' if HEIF_OK else '⚠️ pillow-heif未導入'}")
+    st.write(f"AVIF対応: {'✅' if AVIF_OK else '⚠️ pillow-avif未導入'}")
+    st.write(f"トリミングUI: {'✅ streamlit-cropper有効' if CROPPER_OK else '⚠️ 自動センタークロップのみ'}")
 
-mode = st.radio("入力モード", ["プレスリリースモード", "Sharepointコピペモード"], horizontal=True)
+mode = st.radio(
+    "入力モード",
+    ["プレスリリースモード", "Sharepointコピペモード", "画像リサイズモード"],
+    horizontal=True,
+)
 
-# 共有の作業用変数
+# 共有の作業用変数（PPT用）
 title_final = ""
 summary_final = ""
 engine_used = "NO_SUMMARY"
@@ -480,7 +545,10 @@ if mode == "プレスリリースモード":
         with left:
             st.write("抽出タイトル:", parsed.get("title") or "(なし)")
             raw_text = parsed.get("text") or ""
-            st.write("本文（先頭プレビュー）:", raw_text[:300] + ("…" if len(raw_text) > 300 else ""))
+            st.write(
+                "本文（先頭プレビュー）:",
+                raw_text[:300] + ("…" if len(raw_text) > 300 else ""),
+            )
         with right:
             st.write("候補画像URL（先頭から使用）")
             candidates = parsed.get("images", [])
@@ -493,8 +561,12 @@ if mode == "プレスリリースモード":
         client = get_client(api_key or None)
         title_final = gpt_shorten_title(client, parsed.get("title") or "（無題）")
 
-        summary_final, engine_used = do_summary(parsed.get("text") or "", summary_length, api_key)
-        st.info(f"要約エンジン: {engine_used} / 原文: {len(parsed.get('text') or '')}文字 → 出力: {len(summary_final)}文字")
+        summary_final, engine_used = do_summary(
+            parsed.get("text") or "", summary_length, api_key
+        )
+        st.info(
+            f"要約エンジン: {engine_used} / 原文: {len(parsed.get('text') or '')}文字 → 出力: {len(summary_final)}文字"
+        )
 
         sel_urls = parsed.get("images", [])[:max_images]
         images = download_images(sel_urls, limit=max_images)
@@ -509,28 +581,36 @@ if mode == "プレスリリースモード":
         parsed_preview = {"title": title_final, "summary": summary_final}
 
 # ============== モード2：コピペ＋画像アップロード ==============
-else:
+elif mode == "Sharepointコピペモード":
     manual_title = st.text_input("記事タイトル（コピペ）")
     manual_body = st.text_area("記事本文（コピペ）", height=220)
     colA, colB = st.columns(2)
     with colA:
-        do_summarize = st.checkbox("本文を要約する（サイドバーの上限文字数を使用）", value=True)
+        do_summarize = st.checkbox(
+            "本文を要約する（サイドバーの上限文字数を使用）", value=True
+        )
     with colB:
-        do_shorten_title = st.checkbox("タイトルが25文字超なら短縮する", value=True)
+        do_shorten_title = st.checkbox(
+            "タイトルが25文字超なら短縮する", value=True
+        )
 
     uploaded_files = st.file_uploader(
         "画像をアップロード（最大3枚まで）",
         type=[
-            "jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif", "gif",
-            "heic", "heif",
-            "avif"
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+            "bmp",
+            "tiff",
+            "tif",
+            "gif",
+            "heic",
+            "heif",
+            "avif",
         ],
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
-
-    with st.expander("対応フォーマット情報", expanded=False):
-        st.write(f"HEIC/HEIF対応: {'✅' if HEIF_OK else '⚠️ pillow-heif未導入'}")
-        st.write(f"AVIF対応: {'✅' if AVIF_OK else '⚠️ pillow-avif-plugin未導入'}")
 
     if st.button("① プレビュー生成（コピペ版）"):
         if not manual_title and not manual_body:
@@ -538,12 +618,16 @@ else:
         else:
             client = get_client(api_key or None)
             if do_shorten_title:
-                title_final = gpt_shorten_title(client, manual_title or "（無題）")
+                title_final = gpt_shorten_title(
+                    client, manual_title or "（無題）"
+                )
             else:
                 title_final = (manual_title or "（無題）")[:100]
 
             if do_summarize:
-                summary_final, engine_used = do_summary(manual_body or "", summary_length, api_key)
+                summary_final, engine_used = do_summary(
+                    manual_body or "", summary_length, api_key
+                )
             else:
                 summary_final = (manual_body or "")[:summary_length]
                 engine_used = "NO_SUMMARY"
@@ -574,7 +658,9 @@ else:
     if manual_prev:
         st.subheader("抽出結果プレビュー（コピペ版）")
         st.write("**タイトル（最終）**:", manual_prev["title"])
-        st.write(f"**本文（{manual_prev['out_len']}文字 / エンジン: {manual_prev['engine']} / 原文{manual_prev['raw_len']}文字）**:")
+        st.write(
+            f"**本文（{manual_prev['out_len']}文字 / エンジン: {manual_prev['engine']} / 原文{manual_prev['raw_len']}文字）**:"
+        )
         st.write(manual_prev["summary"])
         if images:
             cols = st.columns(min(len(images), 3))
@@ -589,58 +675,182 @@ else:
         engine_used = manual_prev["engine"]
         parsed_preview = manual_prev
 
-# ============== 共通：PPT生成（デバッグ出力あり） ==============
-st.markdown("---")
-if st.button("② PPTを作成してダウンロード"):
-    try:
-        tpl_path = TEMPLATE_PATH
-        if template_file is not None:
-            tpl_path = "uploaded_template.pptx"
-            with open(tpl_path, "wb") as f:
-                f.write(template_file.read())
-
-        import os
-        if not os.path.exists(tpl_path):
-            st.error(f"テンプレが見つかりません: {tpl_path}")
-        elif not parsed_preview:
-            st.error("先に①でプレビューを作成してください。")
-        else:
-            if show_debug:
-                # slide は build 内なのでここでは概況だけ
-                st.write({
-                    "layout_candidates": [
-                        "Cuprum Title+Body",
-                        "Cuprum Title+Body+1Pic",
-                        "Cuprum Title+Body+2Pic",
-                        "Cuprum Title+Body+3Pic",
-                    ],
-                    "images_count": len(images or []),
-                    "fit_mode": fit_mode,
-                    "title_preview": (title_final[:40] + ("…" if len(title_final) > 40 else "")),
-                    "summary_preview": (summary_final[:60] + ("…" if len(summary_final) > 60 else "")),
-                    "engine_used": engine_used,
-                })
-
-            ppt_bytes = build_pptx(
-                tpl_path,
-                title_final or "（無題）",
-                summary_final or "",
-                images or [],
-                fit_mode=fit_mode
-            )
-            if not isinstance(ppt_bytes, (bytes, bytearray)) or len(ppt_bytes) == 0:
-                st.error("PPT生成に失敗しました（データ不正または空ファイル）。")
-            else:
-                st.success("PPTを生成しました。")
-                st.download_button(
-                    "ダウンロード",
-                    data=ppt_bytes,
-                    file_name="press_auto.pptx",
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                )
-    except Exception as e:
-        import traceback
-        st.error(f"PPT生成に失敗しました: {type(e).__name__}: {e}")
-        st.code("".join(traceback.format_exc()))
+# ============== モード3：画像リサイズモード ==============
 else:
-    st.caption("① 抽出/プレビュー → ② PPT作成 の順で操作してください。")
+    st.subheader("画像リサイズモード（4:3トリミング＋PNG変換）")
+
+    resize_px = st.radio(
+        "長辺ピクセル数を選択",
+        [1280, 1000, 600],
+        index=0,
+        horizontal=True,
+    )
+
+    uploaded_photos = st.file_uploader(
+        "iPhoneなどで撮影した写真をアップロード（複数可）",
+        type=[
+            "jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif", "gif",
+            "heic", "heif", "avif",
+        ],
+        accept_multiple_files=True,
+    )
+
+    # ここで処理した画像をためておく
+    processed_images: List[tuple[str, Image.Image]] = []
+
+    if uploaded_photos:
+        # セッションに「確定済みトリミング」を保持する辞書を用意
+        if "crop_results" not in st.session_state:
+            st.session_state["crop_results"] = {}
+        crop_results = st.session_state["crop_results"]
+
+        for idx, f in enumerate(uploaded_photos):
+            img = _open_image_any(f)
+            if img is None:
+                continue
+
+            w, h = img.size
+            ratio = w / h if h != 0 else 0
+            target_ratio = 4 / 3
+            is_landscape = w >= h
+            is_almost_4_3 = is_landscape and abs(ratio - target_ratio) < 0.02
+
+            st.write(f"### 画像 {idx+1}: {getattr(f, 'name', f'image_{idx+1}')}")
+            st.image(img, caption="元画像プレビュー", use_container_width=True)
+
+            # まず「候補のクロップ画像」を作る（UIで調整用）
+            if is_almost_4_3:
+                st.info("ほぼ4:3の横画像のため、そのままリサイズ対象にします。")
+                preview_crop = img
+            else:
+                if CROPPER_OK:
+                    st.info(
+                        "4:3以外または縦画像のため、4:3でトリミングしてください。"
+                        "枠を調整してから、下の『このトリミングを確定』を押すと固定されます。"
+                    )
+                    preview_crop = st_cropper(
+                        img,
+                        aspect_ratio=(4, 3),
+                        box_color="#00FF00",
+                        key=f"cropper_{idx}",
+                        realtime_update=True,   # プレビューは動かすたびに更新
+                        return_type="image",
+                    )
+                else:
+                    st.warning(
+                        "streamlit-cropper未導入のため、自動で中央4:3にトリミングします。"
+                    )
+                    preview_crop = crop_to_4_3_center(img)
+
+            # 「このトリミングで固定」ボタン
+            confirm_key = f"confirm_crop_{idx}"
+            if st.button("このトリミングを確定", key=confirm_key):
+                crop_results[idx] = preview_crop
+                st.success("この画像のトリミングを確定しました。")
+
+            # 実際にリサイズに使う画像：確定済みがあればそれを使う
+            used_crop = crop_results.get(idx, preview_crop)
+
+            resized = resize_long_side(used_crop, resize_px)
+            st.image(
+                resized,
+                caption=f"リサイズ後プレビュー（長辺 {resize_px}px / PNG出力）",
+                use_container_width=True,
+            )
+
+            base_name = getattr(f, "name", f"image_{idx+1}")
+            base_name = re.sub(r"\.[^.]+$", "", base_name)
+            out_name = f"{base_name}_{resize_px}px.png"
+            processed_images.append((out_name, resized))
+
+    # ZIPダウンロードは「今のプレビューたち」をまとめるだけ
+    if processed_images:
+        import zipfile
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname, im in processed_images:
+                img_bytes = io.BytesIO()
+                im.save(img_bytes, format="PNG")
+                img_bytes.seek(0)
+                zf.writestr(fname, img_bytes.read())
+        zip_buf.seek(0)
+
+        st.success(f"{len(processed_images)} ファイルをリサイズし、ZIPにまとめました。")
+        st.download_button(
+            "リサイズ画像ZIPをダウンロード",
+            data=zip_buf,
+            file_name=f"resized_images_{resize_px}px.zip",
+            mime="application/zip",
+        )
+    else:
+        st.caption("画像をアップロードすると、ここにリサイズ結果とZIPダウンロードボタンが表示されます。")
+
+# ============== 共通：PPT生成（モード1&2のみ） ==============
+if mode in ["プレスリリースモード", "Sharepointコピペモード"]:
+    st.markdown("---")
+    if st.button("② PPTを作成してダウンロード"):
+        try:
+            tpl_path = TEMPLATE_PATH
+            if template_file is not None:
+                tpl_path = "uploaded_template.pptx"
+                with open(tpl_path, "wb") as f:
+                    f.write(template_file.read())
+
+            import os
+
+            if not os.path.exists(tpl_path):
+                st.error(f"テンプレが見つかりません: {tpl_path}")
+            elif not parsed_preview:
+                st.error("先に①でプレビューを作成してください。")
+            else:
+                if show_debug:
+                    st.write(
+                        {
+                            "layout_candidates": [
+                                "Cuprum Title+Body",
+                                "Cuprum Title+Body+1Pic",
+                                "Cuprum Title+Body+2Pic",
+                                "Cuprum Title+Body+3Pic",
+                            ],
+                            "images_count": len(images or []),
+                            "fit_mode": fit_mode,
+                            "title_preview": (
+                                title_final[:40]
+                                + ("…" if len(title_final) > 40 else "")
+                            ),
+                            "summary_preview": (
+                                summary_final[:60]
+                                + ("…" if len(summary_final) > 60 else "")
+                            ),
+                            "engine_used": engine_used,
+                        }
+                    )
+
+                ppt_bytes = build_pptx(
+                    tpl_path,
+                    title_final or "（無題）",
+                    summary_final or "",
+                    images or [],
+                    fit_mode=fit_mode,
+                )
+                if not isinstance(ppt_bytes, (bytes, bytearray)) or len(ppt_bytes) == 0:
+                    st.error("PPT生成に失敗しました（データ不正または空ファイル）。")
+                else:
+                    st.success("PPTを生成しました。")
+                    st.download_button(
+                        "ダウンロード",
+                        data=ppt_bytes,
+                        file_name="press_auto.pptx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "presentationml.presentation"
+                        ),
+                    )
+        except Exception as e:
+            import traceback
+
+            st.error(f"PPT生成に失敗しました: {type(e).__name__}: {e}")
+            st.code("".join(traceback.format_exc()))
+    else:
+        st.caption("① 抽出/プレビュー → ② PPT作成 の順で操作してください。")
