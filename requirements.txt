@@ -8,3 +8,5 @@ readability-lxml
 openai>=1.35.0
 pillow-heif>=0.16
 pillow-avif-plugin>=1.4
+streamlit-cropper
+
